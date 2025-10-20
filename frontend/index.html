@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>UniLib - Quản lý Thư viện</title>
+    <link rel="icon" type="image/x-icon" href="favicon.ico" />
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>UniLib - Hệ thống Quản lý Thư viện</h1>
+      <p>
+        Sử dụng WebSocket cho real-time updates & AI cho tìm kiếm thông minh
+        (SQLite DB)
+      </p>
+    </header>
+
+    <section id="search-section">
+      <h2>Tìm kiếm Thông minh</h2>
+      <input
+        type="text"
+        id="searchInput"
+        placeholder="Nhập từ khóa (ví dụ: 'sách về AI và học máy')..."
+      />
+      <button onclick="searchBooks()">Tìm kiếm với AI</button>
+      <div id="searchResults"></div>
+    </section>
+
+    <section id="books-section">
+      <h2>Danh sách Sách</h2>
+      <ul id="booksList"></ul>
+    </section>
+
+    <section id="add-section">
+      <h2>Thêm Sách Mới</h2>
+      <form id="addBookForm">
+        <input type="text" id="title" placeholder="Tiêu đề sách" required />
+        <input type="text" id="author" placeholder="Tác giả" required />
+        <textarea
+          id="description"
+          placeholder="Mô tả sách (dùng cho tìm kiếm AI)"
+          required
+        ></textarea>
+        <input type="text" id="isbn" placeholder="ISBN (tùy chọn)" />
+        <button type="submit">Thêm Sách</button>
+      </form>
+    </section>
+    <script src="script.js"></script>
+  </body>
+</html>
