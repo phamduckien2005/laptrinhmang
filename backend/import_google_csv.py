@@ -1,36 +1,56 @@
 import csv
-from app import app, db, Book  # Import app để tạo context
+import os
+from app import db, Book, app  # 🔥 tái sử dụng model Book và cấu hình Flask đã có
 
-CSV_FILE = 'books_from_google.csv'  # File CSV từ script lấy sách
+# =================== IMPORT CSV VÀO DATABASE =====================
 
-# Tạo application context để sử dụng db.session
-with app.app_context():
-    # Xóa DB cũ nếu cần (comment nếu giữ dữ liệu cũ)
-    Book.query.delete()
-    db.session.commit()
+def import_from_csv(csv_path="books_from_google.csv"):
+    """Đọc file CSV và chèn vào database UniLib"""
+    if not os.path.exists(csv_path):
+        print(f"❌ Không tìm thấy file: {csv_path}")
+        return
 
-    imported = 0
-    with open(CSV_FILE, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row['title'] == 'title': continue  # Skip header
-            book = Book(
-                title=row['title'][:200],  # Giới hạn length để tránh DB error
-                author=row['author'][:100],
-                description=row['description'][:500],
-                isbn=row['isbn'],
-                available=row['available'].lower() == 'true'
-            )
-            db.session.add(book)
-            imported += 1
-            if imported % 100 == 0:
-                db.session.commit()
-                print(f"Imported {imported} books...")
-    db.session.commit()
-    print(f"✅ Imported {imported} books into unilib.db!")
+    with app.app_context():  # Đảm bảo có context của Flask
+        added = 0
+        skipped = 0
 
-    # Test DB trong context
-    books = Book.query.limit(5).all()
-    print("\n5 sách mẫu trong DB:")
-    for b in books:
-        print(f"- {b.title} by {b.author} (Available: {b.available}) | Created: {b.created_at}")
+        with open(csv_path, newline='', encoding="utf-8") as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                title = row.get("title", "").strip()
+                author = row.get("author", "").strip()
+                description = row.get("description", "").strip()
+                isbn = row.get("isbn", "").strip()
+                image = row.get("image", "").strip()
+                available = row.get("available", "True").strip().lower() in ["true", "1", "yes"]
+
+                if not title or not author:
+                    skipped += 1
+                    continue
+
+                # Tránh thêm trùng
+                if Book.query.filter_by(title=title, author=author).first():
+                    skipped += 1
+                    continue
+
+                # Tạo đối tượng Book
+                book = Book(
+                    title=title,
+                    author=author,
+                    description=description or "No description available.",
+                    isbn=isbn or None,
+                    image=image or None,
+                    available=available
+                )
+                db.session.add(book)
+                added += 1
+
+            db.session.commit()
+
+        print(f"✅ Đã import {added} sách mới vào database.")
+        if skipped:
+            print(f"⚠️ Bỏ qua {skipped} sách trùng hoặc thiếu dữ liệu.")
+
+if __name__ == "__main__":
+    csv_path = os.path.join(os.path.dirname(__file__), "books_from_google.csv")
+    import_from_csv(csv_path)

@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login/Signup Form</title>
+    <link rel="stylesheet" href="SignUp_LogIn_Form.css">
+    <link href='https://unpkg.com/boxicons@2.1.4/css/boxicons.min.css' rel='stylesheet'>
+</head>
+  <body>
+
+    <!-- credits to the writter @leonam-silva-de-souza -->
+      <div class="container">
+          <div class="form-box login">
+              <form action="#">
+                  <h1>Login</h1>
+                  <div class="input-box">
+                      <input type="text" placeholder="Username" required>
+                      <i class='bx bxs-user'></i>
+                  </div>
+                  <div class="input-box">
+                      <input type="password" placeholder="Password" required>
+                      <i class='bx bxs-lock-alt' ></i>
+                  </div>
+                  <div class="forgot-link">
+                      <a href="forgotpassword.html">Forgot Password?</a>
+                  </div>
+                  <button type="submit" class="btn">Login</button>
+                  <p>or login with social platforms</p>
+                  <div class="social-icons">
+                        <a href="#" class="social-btn"><i class='bx bxl-google'></i></a>
+                        <a href="#" class="social-btn"><i class='bx bxl-facebook'></i></a>
+                        <a href="#" class="social-btn"><i class='bx bxl-github'></i></a>
+                        <a href="#" class="social-btn"><i class='bx bxl-linkedin'></i></a>
+                    </div>
+              </form>
+          </div>
+
+          <div class="form-box register">
+              <form action="#">
+                  <h1>Registration</h1>
+                  <div class="input-box">
+                      <input type="text" placeholder="Username" required>
+                      <i class='bx bxs-user'></i>
+                  </div>
+                  <div class="input-box">
+                      <input type="email" placeholder="Email" required>
+                      <i class='bx bxs-envelope' ></i>
+                  </div>
+                  <div class="input-box">
+                      <input type="password" placeholder="Password" required>
+                      <i class='bx bxs-lock-alt' ></i>
+                  </div>
+                  <button type="submit" class="btn">Register</button>
+                  <p>or register with social platforms</p>
+                  <div class="social-icons">
+                      <a href="#"><i class='bx bxl-google' ></i></a>
+                      <a href="#"><i class='bx bxl-facebook' ></i></a>
+                      <a href="#"><i class='bx bxl-github' ></i></a>
+                      <a href="#"><i class='bx bxl-linkedin' ></i></a>
+                  </div>
+              </form>
+          </div>
+
+          <div class="toggle-box">
+              <div class="toggle-panel toggle-left">
+                  <h1>Hello, Welcome!</h1>
+                  <p>Don't have an account?</p>
+                  <button class="btn register-btn">Register</button>
+              </div>
+
+              <div class="toggle-panel toggle-right">
+                  <h1>Welcome Back!</h1>
+                  <p>Already have an account?</p>
+                  <button class="btn login-btn">Login</button>
+              </div>
+          </div>
+      </div>
+    <div id="toast"
+        style="display:none; position:fixed; top:20px; right:20px; padding:12px 20px;
+                background:#4CAF50; color:white; border-radius:8px;
+                box-shadow:0 4px 8px rgba(0,0,0,0.2); z-index:9999;">
+    </div>
+      <script src="SignUp_LogIn_Form.js"></script>
+    <script>
+    const API_URL = "http://127.0.0.1:3000";// Flask chạy port 3000
+
+    window.addEventListener("DOMContentLoaded", () => {
+    const registerForm = document.querySelector(".register form");
+
+    registerForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+
+        const username = registerForm.querySelector('input[placeholder="Username"]').value.trim();
+        const email = registerForm.querySelector('input[placeholder="Email"]').value.trim();
+        const password = registerForm.querySelector('input[placeholder="Password"]').value.trim();
+
+        try {
+        const res = await fetch(`${API_URL}/register`, {
+            credentials: "include",//
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ username, email, password }),
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+            // alert(data.message);
+            showToast(data.message);
+            registerForm.reset();
+            
+        } else {
+            // alert((data.message || "Đăng ký thất bại!"));
+             showToast(data.message || "Đăng ký thất bại!", true);
+        }
+        } catch (err) {
+        console.error(err);
+        // alert("Không thể kết nối đến server!");
+        showToast("Không thể kết nối đến server!", true);
+        }
+    });
+    });
+        // Xử lý ĐĂNG NHẬP
+    document.querySelector('.login form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const username = document.querySelector('.login input[placeholder="Username"]').value;
+    const password = document.querySelector('.login input[placeholder="Password"]').value;
+
+    const res = await fetch(`${API_URL}/login`, {
+        credentials: "include",//
+        method: 'POST',
+        credentials: "include", //them
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+    });
+
+    const data = await res.json();
+    if (res.ok) {
+        // alert(data.message);
+         showToast(data.message);
+         localStorage.setItem("loggedInUser", username);
+           setTimeout(() => {
+        window.location.href = "/web/index.html"; //cho chuyen cham lai
+    }, 1500);
+    } else {
+        // alert((data.message || 'Sai tên đăng nhập hoặc mật khẩu!'));
+        showToast(data.message || 'Sai tên đăng nhập hoặc mật khẩu!', true);
+    }
+    });
+    // 🔒 Chặn click vào icon mạng xã hội (chưa hỗ trợ)
+    document.querySelectorAll(".social-btn").forEach(btn => {
+        btn.addEventListener("click", (e) => {
+            e.preventDefault();
+            showToast("Tính năng này chưa được hỗ trợ!", true);
+        });
+    });
+
+</script>
+
+  </body>
+</html>

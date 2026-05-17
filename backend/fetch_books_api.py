@@ -1,149 +1,120 @@
 import requests
-import csv
 import time
 import random
 from datetime import datetime
+from app import db, Book, app
 
-# Cấu hình API (Chỉnh sửa ở đây)
-API_KEY = 'AIzaSyCkR6xFNpyCQ4tdAcw3E1_8VrrT24XkLn8'  # Thay bằng key từ Bước 1 (AIzaSyB...xyz)
-QUERY = 'AI books'  # Query tìm kiếm: "AI books" – thay bằng 'sách AI' hoặc 'library management books'
-MAX_RESULTS_PER_PAGE = 40  # Số sách/trang (max của API)
-TOTAL_BOOKS = 1000  # Mục tiêu lấy (nếu hit limit, lấy ít hơn)
-OUTPUT_FILE = 'books_from_google.csv'  # File CSV xuất ra (trong backend/)
+# ===================== CẤU HÌNH =====================
+API_KEY = "AIzaSyCkR6xFNpyCQ4tdAcw3E1_8VrrT24XkLn8"
+MAX_RESULTS = 40
+TOTAL_BOOKS_TARGET = 3000
+WAIT_TIME = 0.3  # tạm nghỉ giữa các request
+QUERIES = [
+    # AI & Machine Learning
+    "Artificial Intelligence", "AI books", "Deep Learning", "Machine Learning",
+    "Neural Networks", "Data Science", "Computer Vision", "NLP", "Reinforcement Learning",
 
-# Headers cho API (bắt buộc để tránh block)
-headers = {
-    'User-Agent': 'UniLib Project (hangbie995@gmail.com)'  # Thay email thật để tuân thủ Google policy
-}
+    # Programming & Software
+    "Python programming", "JavaScript programming", "C++ programming", "Web Development",
+    "Algorithms", "Data Structures", "Software Engineering", "Programming Design Patterns",
 
-def fetch_books(start_index, num_results):
-    """Lấy 1 trang sách từ Google Books API"""
-    url = 'https://www.googleapis.com/books/v1/volumes'
+    # Cloud & Database
+    "Cloud computing", "AWS", "Azure", "Google Cloud", "SQL", "NoSQL", "Database systems",
+
+    # IoT & Robotics
+    "Internet of Things", "IoT Sensors", "Embedded Systems", "Robotics", "Automation",
+
+    # Misc & Science
+    "Cybersecurity", "Quantum computing", "Bioinformatics", "Mathematics", "Physics", "Chemistry"
+]
+
+
+# ===================== HÀM LẤY DỮ LIỆU =====================
+def fetch_books_from_google(query, start_index):
+    """Gọi API Google Books"""
+    url = "https://www.googleapis.com/books/v1/volumes"
     params = {
-        'q': QUERY,
-        'startIndex': start_index,
-        'maxResults': num_results,
-        'key': API_KEY,
-        'projection': 'full',  # Lấy full metadata (title, authors, description, isbn)
-        'langRestrict': 'en'  # Giới hạn tiếng Anh ('vi' cho tiếng Việt, nhưng kết quả ít)
+        "q": query,
+        "startIndex": start_index,
+        "maxResults": MAX_RESULTS,
+        "projection": "full",
+        "langRestrict": "en",
+        "key": API_KEY
     }
-    response = requests.get(url, params=params, headers=headers)
-    if response.status_code == 200:
-        data = response.json()
-        if 'error' in data:
-            print(f"Lỗi API: {data['error']['message']}")
-            return None
-        return data
-    else:
-        print(f"Lỗi HTTP {response.status_code}: {response.text[:200]}...")  # In lỗi ngắn
-        return None
+    r = requests.get(url, params=params)
+    if r.status_code != 200:
+        print(f"⚠️ Lỗi {r.status_code}: {r.text[:100]}")
+        return []
+    data = r.json()
+    return data.get("items", [])
 
-def extract_book_info(volume):
-    """Trích xuất metadata từ 1 volume (sách)"""
-    info = volume.get('volumeInfo', {})
-    title = info.get('title', 'Unknown Title').strip()[:200]  # Giới hạn title
-    authors = ', '.join(info.get('authors', ['Unknown Author']))[:100]
-    description = info.get('description', 'No description available.').strip()[:300]  # Giới hạn description cho AI search
-    if len(description) > 0 and not description.endswith('.'):
-        description += '.'  # Thêm dấu chấm nếu thiếu
-    
-    # ISBN (ưu tiên ISBN-13, nếu không dùng ISBN-10 hoặc fake)
-    isbn = ''
-    identifiers = info.get('industryIdentifiers', [])
-    for iden in identifiers:
-        if iden['type'] in ['ISBN_13', 'ISBN_10']:
-            isbn = iden['identifier']
+def extract_book_info(item):
+    """Trích xuất thông tin cần thiết"""
+    info = item.get("volumeInfo", {})
+    title = info.get("title", "Unknown Title")[:200]
+    authors = ", ".join(info.get("authors", ["Unknown Author"]))[:100]
+    description = info.get("description", "No description available.")[:500]
+    isbn = None
+    for i in info.get("industryIdentifiers", []):
+        if i["type"] in ("ISBN_10", "ISBN_13"):
+            isbn = i["identifier"]
             break
     if not isbn:
-        isbn = f"ISBN-{random.randint(1000000000, 9999999999)}"  # Fake ISBN unique
-    
-    # Kéo ảnh bìa từ API (thumbnail URL)
-    image_url = info.get('imageLinks', {}).get('thumbnail', '')  # URL ảnh bìa từ Google Books API
-    
-    available = random.choice([True, False])  # Random true/false cho available (có sẵn/đã mượn)
-    
-    return {
-        'title': title,
-        'author': authors,
-        'description': description,
-        'isbn': isbn,
-        'image': image_url,  # Thêm URL ảnh bìa từ API
-        'available': available
-    }
+        isbn = f"ISBN-{random.randint(1000000000,9999999999)}"
+    image = info.get("imageLinks", {}).get("thumbnail", "")
+    preview_link = info.get("previewLink", "")
+    available = random.choice([True, False])
+    return dict(
+        title=title, author=authors, description=description,
+        isbn=isbn, image=image, available=available,
+        file_path=preview_link
+    )
 
-# Main script: Lấy dữ liệu phân trang
-print(f"Bắt đầu lấy dữ liệu sách với query '{QUERY}'...")
-print(f"Mục tiêu: {TOTAL_BOOKS} sách. Rate limit: 1000 query/ngày.")
-print(f"API Key: {'OK' if API_KEY != 'YOUR_API_KEY_HERE' else 'CẢNH BÁO: Thay API_KEY trước khi chạy!'}")
+# ===================== CHẠY CHƯƠNG TRÌNH =====================
+if __name__ == "__main__":
+    print("📘 Database initialized at:", app.config["SQLALCHEMY_DATABASE_URI"])
+    total_added = 0
+    seen = set()
 
-all_books = []
-start_index = 0
-page_count = 0
-while len(all_books) < TOTAL_BOOKS:
-    print(f"\n--- Trang {page_count + 1} --- Đang lấy từ index {start_index}... (Đã có {len(all_books)} sách)")
-    
-    data = fetch_books(start_index, MAX_RESULTS_PER_PAGE)
-    if not data or 'items' not in data:
-        print("Không có dữ liệu nữa hoặc lỗi API. Dừng lấy.")
-        break
-    
-    page_books = data['items']
-    if not page_books:
-        print("Trang rỗng – có lẽ hết kết quả.")
-        break
-    
-    for i, volume in enumerate(page_books, 1):
-        book_info = extract_book_info(volume)
-        all_books.append(book_info)
-        print(f"  + Sách {len(all_books)}: {book_info['title'][:50]}...")
-        
-        if len(all_books) >= TOTAL_BOOKS:
-            print(f"Đã đạt mục tiêu {TOTAL_BOOKS} sách!")
-            break
-    
-    start_index += MAX_RESULTS_PER_PAGE
-    page_count += 1
-    
-    # Kiểm tra total items từ API (nếu hết)
-    total_items = data.get('totalItems', 0)
-    if start_index >= total_items:
-        print(f"Đã lấy hết {total_items} kết quả từ API.")
-        break
-    
-    # Delay để tránh rate limit (0.2s/query – an toàn cho 1000/ngày)
-    time.sleep(0.2)
-    
-    # Kiểm tra nếu hit quota (API trả error)
-    if 'error' in data and 'quotaExceeded' in str(data['error']).lower():
-        print("Cảnh báo: Hit rate limit (1000 query/ngày). Dừng và chờ 24h.")
-        break
+    with app.app_context():
+        for query in QUERIES:
+            print(f"\n🔎 Đang lấy sách chủ đề: {query}")
+            start_index = 0
 
-# Xuất ra CSV nếu có dữ liệu
-if all_books:
-    with open(OUTPUT_FILE, 'w', newline='', encoding='utf-8') as file:
-        fieldnames = ['title', 'author', 'description', 'isbn', 'image', 'available']  # Thêm 'image' vào fieldnames
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(all_books)
-    
-    print(f"\n🎉 Thành công! Đã lấy {len(all_books)} sách và xuất vào '{OUTPUT_FILE}'.")
-    print(f"File CSV: {OUTPUT_FILE} (cột: title, author, description, isbn, image, available).")
-    print(f"Số trang lấy: {page_count}. Total query: {page_count} (dưới limit nếu <1000).")
-else:
-    print("\n❌ Không lấy được sách nào. Kiểm tra:")
-    print("- API_KEY đúng chưa? (Thay 'YOUR_API_KEY_HERE').")
-    print("- QUERY hợp lệ? (Thử 'programming books' nếu 'AI books' ít kết quả).")
-    print("- Rate limit? Chờ 24h hoặc tạo project mới.")
-    print("- Internet ổn định? Thử query nhỏ: TOTAL_BOOKS=100.")
+            while total_added < TOTAL_BOOKS_TARGET:
+                items = fetch_books_from_google(query, start_index)
+                if not items:
+                    print("❌ Hết kết quả hoặc lỗi API.")
+                    break
 
-# In 5 sách mẫu để kiểm tra
-print("\n📚 5 sách mẫu lấy được:")
-for i, book in enumerate(all_books[:5], 1):
-    status = "Có sẵn" if book['available'] else "Đã mượn"
-    print(f"{i}. {book['title']} bởi {book['author']}")
-    print(f"   Mô tả: {book['description'][:100]}...")
-    print(f"   ISBN: {book['isbn']} | Ảnh: {book['image'] or 'Không có'} | Trạng thái: {status}\n")
+                added_now = 0
+                for item in items:
+                    info = extract_book_info(item)
+                    key = (info["title"], info["author"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
 
-# Lưu thời gian chạy
-end_time = datetime.now()
-print(f"Hoàn thành lúc: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    # Kiểm tra trùng trong DB
+                    if not Book.query.filter_by(title=info["title"], author=info["author"]).first():
+                        book = Book(**info)
+                        db.session.add(book)
+                        added_now += 1
+                        total_added += 1
+
+                    if total_added >= TOTAL_BOOKS_TARGET:
+                        break
+
+                db.session.commit()
+                print(f"✅ Đã thêm {added_now} sách... (Tổng: {total_added})")
+                if added_now == 0:
+                    break
+
+                start_index += MAX_RESULTS
+                time.sleep(WAIT_TIME)
+
+                if total_added >= TOTAL_BOOKS_TARGET:
+                    break
+
+        print(f"\n🎉 Hoàn tất! Tổng số: {total_added} sách.")
+        print("🕒 Kết thúc lúc:", datetime.now().strftime("%H:%M:%S"))
