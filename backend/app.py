@@ -15,25 +15,61 @@ import requests
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
 load_dotenv(os.path.join(current_dir, ".env"))
-try:
-    from faq_service import find_best_answer
-    print("Đã import chatbot từ faq_service.py thành công!")
-except ImportError as e:
-    print(f"Lỗi import faq.py: {e}")
-    print("Sử dụng chatbot đơn giản thay thế")
-    
-    # Hàm thay thế nếu import lỗi
-    def find_best_answer(message, threshold=0.0):
-        faq_data = {
-            "mượn sách": "Tìm sách và bấm nút Mượn sách.",
-            "trả sách": "Vào mục Đã mượn, bấm nút Trả.",
-            "thời gian mượn": "30 ngày.",
-        }
-        message = message.lower()
-        for q, a in faq_data.items():
-            if q in message:
-                return a, 1.0
-        return "Xin lỗi, tôi chưa hiểu câu hỏi.", 0.0
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "45"))
+
+def ask_ollama(message):
+    """Call local Ollama for natural chatbot replies."""
+    system_prompt = (
+        "Bạn là Trợ lý AI UniLib, chatbot hỗ trợ người dùng trong hệ thống "
+        "thư viện UniLib. Luôn trả lời bằng tiếng Việt, thân thiện, ngắn gọn "
+        "và tự nhiên. Khi người dùng hỏi bạn là ai, hãy tự giới thiệu là trợ "
+        "lý AI của UniLib, không tự giới thiệu là model của Meta/Ollama. Bạn "
+        "không được tự nhận UniLib là lớn nhất, tốt nhất hoặc thêm thông tin "
+        "quảng bá không có trong hệ thống. "
+        "có thể chào hỏi, trò chuyện cơ bản và hướng dẫn người dùng hỏi về "
+        "thư viện, tìm sách, mượn sách, trả sách. Ngữ cảnh hệ thống UniLib: "
+        "người dùng có thể đăng ký, đăng nhập, tìm sách, xem chi tiết sách, "
+        "bấm nút Mượn sách, chọn thời hạn mượn từ 1 đến 90 ngày, xem danh "
+        "sách sách đang mượn và bấm Trả sách. Không gọi thao tác mượn là mua. "
+        "Không tự bịa mức phạt, lịch mở cửa, điều khoản, chính sách hoặc "
+        "thông tin tổ chức nếu chưa chắc; hãy hướng dẫn người dùng kiểm tra "
+        "với thủ thư hoặc dùng chức năng trên hệ thống UniLib."
+    )
+    user_prompt = (
+        "Hãy trả lời người dùng với đúng vai trò Trợ lý AI UniLib.\n"
+        f"Câu hỏi của người dùng: {message}"
+    )
+
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL.rstrip('/')}/api/chat",
+            json={
+                "model": OLLAMA_MODEL,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "options": {
+                    "temperature": 0.7,
+                    "num_predict": 220,
+                },
+            },
+            timeout=OLLAMA_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        reply = (data.get("message") or {}).get("content") or data.get("response")
+        return reply.strip() if reply else None
+    except requests.RequestException as exc:
+        print(f"Ollama request failed: {exc}")
+        return None
+    except ValueError as exc:
+        print(f"Ollama response is not valid JSON: {exc}")
+        return None
 
 # ===================== FLASK SETUP =====================
 app = Flask(__name__)
@@ -409,35 +445,21 @@ def chat():
     if not message:
         return jsonify({"error": "Message is required"}), 400
 
-    # Lời chào đặc biệt
-    if message.lower() in ["xin chào", "chào", "hello", "hi"]:
+    ollama_reply = ask_ollama(message)
+    if ollama_reply:
         return jsonify({
-            "reply": "Xin chào mình là Trợ lý ảo UniLib! Mình có thể giúp gì cho bạn?",
-            "source": "greeting",
+            "reply": ollama_reply,
+            "source": "ollama",
+            "model": OLLAMA_MODEL,
             "confidence": 1.0
         })
 
-    #  GỌI FAQ: luôn lấy câu giống nhất, không chặn bởi threshold bên trong
-    # Sau đó tự kiểm tra score ở đây để hỗ trợ cả câu hỏi chỉ có vài keyword
-    answer, score = find_best_answer(message, threshold=0.0)
-
-    # Ngưỡng chấp nhận: chỉ cần giống vừa phải là trả lời
-    # Bạn có thể chỉnh 0.30 -> 0.25 hoặc 0.35 tùy mức muốn "dễ tính" hay không
-    MIN_SCORE = 0.30
-
-    if answer and score >= MIN_SCORE:
-        return jsonify({
-            "reply": answer,
-            "source": "local",
-            "confidence": score
-        })
-
-    # Không đủ giống -> báo chưa có dữ liệu
     return jsonify({
-        "reply": "Xin lỗi, hiện tại mình chưa có dữ liệu cho câu hỏi này.",
-        "source": "none",
-        "confidence": float(score)
-    })
+        "reply": "Xin lỗi, hiện tại mình chưa kết nối được Ollama. Bạn hãy kiểm tra Ollama đang chạy bằng lệnh `ollama serve` và model `llama3.2:1b` đã được tải.",
+        "source": "ollama_unavailable",
+        "model": OLLAMA_MODEL,
+        "confidence": 0.0
+    }), 503
 # ===================== BOOKS SEARCH API =====================
 def normalize_google_book(item):
     info = item.get("volumeInfo", {})
