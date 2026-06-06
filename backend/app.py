@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from functools import wraps
 from dotenv import load_dotenv
 import requests
+from urllib.parse import quote_plus
 current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
 load_dotenv(os.path.join(current_dir, ".env"))
@@ -99,7 +100,17 @@ INSTANCE_DIR = os.path.join(BASE_DIR, "instance")
 os.makedirs(INSTANCE_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(INSTANCE_DIR, "data.db")
-app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{DB_PATH}"
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    DB_USER = os.getenv("MYSQL_USER", "root")
+    DB_PASSWORD = quote_plus(os.getenv("MYSQL_PASSWORD", ""))
+    DB_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+    DB_PORT = os.getenv("MYSQL_PORT", "3306")
+    DB_NAME = os.getenv("MYSQL_DATABASE", "unilib")
+    DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
+
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
@@ -107,6 +118,7 @@ db = SQLAlchemy(app)
 # ===================== MODEL =====================
 class Book(db.Model):
     id = db.Column(db.Integer, primary_key=True)
+    google_book_id = db.Column(db.String(100))
     title = db.Column(db.String(255))
     author = db.Column(db.String(255))
     description = db.Column(db.Text)
@@ -114,11 +126,19 @@ class Book(db.Model):
     image = db.Column(db.String(500))
     available = db.Column(db.Boolean, default=True)
     file_path = db.Column(db.String(500))
+    quantity = db.Column(db.Integer, default=1)
+    shelf_location = db.Column(db.String(100))
+    category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=True)
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(200), nullable=False)
+    email = db.Column(db.String(255), unique=True, nullable=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    full_name = db.Column(db.String(255))
+    role = db.Column(db.String(50), default="user")
+    is_locked = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -130,29 +150,98 @@ class BorrowRecord(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     book_id = db.Column(db.Integer, db.ForeignKey('book.id'), nullable=False)
+    request_date = db.Column(db.DateTime, default=datetime.utcnow)
     borrow_date = db.Column(db.DateTime, nullable=False)
     due_date = db.Column(db.DateTime, nullable=True)
     return_date = db.Column(db.DateTime, nullable=True)
     returned = db.Column(db.Boolean, default=False)
+    status = db.Column(db.String(30), default="pending")
+    reject_reason = db.Column(db.String(255))
+    fine_amount = db.Column(db.Integer, default=0)
 
     user = db.relationship('User', backref='borrow_records')
     book = db.relationship('Book', backref='borrow_records')
+
+class Category(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), unique=True, nullable=False)
+    description = db.Column(db.String(255))
+
+class Review(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    book_id = db.Column(db.Integer, db.ForeignKey('book.id'), nullable=False)
+    rating = db.Column(db.Integer, default=5)
+    comment = db.Column(db.Text)
+    hidden = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    user = db.relationship('User', backref='reviews')
+    book = db.relationship('Book', backref='reviews')
+
+class Notification(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    notification_type = db.Column(db.String(50), default="general")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class ViolationReport(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    book_id = db.Column(db.Integer, db.ForeignKey('book.id'), nullable=True)
+    report_type = db.Column(db.String(100), nullable=False)
+    message = db.Column(db.Text)
+    status = db.Column(db.String(30), default="open")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    user = db.relationship('User', backref='violation_reports')
+    book = db.relationship('Book', backref='violation_reports')
 
 # ===================== INIT DATABASE =====================
 with app.app_context():
     db.create_all()
     inspector = inspect(db.engine)
+
+    def add_column_if_missing(table_name, existing_columns, column_name, column_sql):
+        if column_name not in existing_columns:
+            with db.engine.begin() as connection:
+                connection.exec_driver_sql(f"ALTER TABLE `{table_name}` ADD COLUMN {column_sql}")
+
+    user_columns = [column["name"] for column in inspector.get_columns("user")]
+    add_column_if_missing("user", user_columns, "email", "email VARCHAR(255)")
+    add_column_if_missing("user", user_columns, "full_name", "full_name VARCHAR(255)")
+    add_column_if_missing("user", user_columns, "role", "role VARCHAR(50) DEFAULT 'user'")
+    add_column_if_missing("user", user_columns, "is_locked", "is_locked BOOLEAN DEFAULT 0")
+    add_column_if_missing("user", user_columns, "created_at", "created_at DATETIME")
+
+    book_columns = [column["name"] for column in inspector.get_columns("book")]
+    add_column_if_missing("book", book_columns, "google_book_id", "google_book_id VARCHAR(100)")
+    add_column_if_missing("book", book_columns, "quantity", "quantity INTEGER DEFAULT 1")
+    add_column_if_missing("book", book_columns, "shelf_location", "shelf_location VARCHAR(100)")
+    add_column_if_missing("book", book_columns, "category_id", "category_id INTEGER")
+
     borrow_columns = [column["name"] for column in inspector.get_columns("borrow_record")]
-    if "due_date" not in borrow_columns:
-        with db.engine.begin() as connection:
-            connection.exec_driver_sql("ALTER TABLE borrow_record ADD COLUMN due_date DATETIME")
-    print(f" Database initialized at: {DB_PATH}")
+    add_column_if_missing("borrow_record", borrow_columns, "request_date", "request_date DATETIME")
+    add_column_if_missing("borrow_record", borrow_columns, "due_date", "due_date DATETIME")
+    add_column_if_missing("borrow_record", borrow_columns, "status", "status VARCHAR(30) DEFAULT 'approved'")
+    add_column_if_missing("borrow_record", borrow_columns, "reject_reason", "reject_reason VARCHAR(255)")
+    add_column_if_missing("borrow_record", borrow_columns, "fine_amount", "fine_amount INTEGER DEFAULT 0")
+
+    default_categories = ["CNTT", "Kinh tế", "Marketing", "Ngoại ngữ", "Tiểu thuyết"]
+    for category_name in default_categories:
+        if not Category.query.filter_by(name=category_name).first():
+            db.session.add(Category(name=category_name))
+    db.session.commit()
+    print(f" Database initialized at: {app.config['SQLALCHEMY_DATABASE_URI'].split('@')[-1]}")
 
 # ===================== AUTH API =====================
 @app.route('/register', methods=['POST'])
 def register():
     data = request.get_json()
     username = data.get('username')
+    email = data.get('email')
+    full_name = data.get('full_name') or username
     password = data.get('password')
 
     if not username or not password:
@@ -161,7 +250,11 @@ def register():
     if User.query.filter_by(username=username).first():
         return jsonify({"message": "Tên người dùng đã tồn tại!"}), 400
 
-    new_user = User(username=username)
+    if email and User.query.filter_by(email=email).first():
+        return jsonify({"message": "Email da ton tai!"}), 400
+
+    role = "super_admin" if username.lower() == "admin" else "user"
+    new_user = User(username=username, email=email, full_name=full_name, role=role)
     new_user.set_password(password)
     db.session.add(new_user)
     db.session.commit()
@@ -178,14 +271,19 @@ def login():
     if not user:
         return jsonify({"status": "error", "message": "Tài khoản không tồn tại!"}), 401
 
+    if user.is_locked:
+        return jsonify({"status": "error", "message": "Tai khoan da bi khoa!"}), 403
+
     if user.check_password(password):
         session["user_id"] = user.id
         session["username"] = username
+        session["role"] = user.role or "user"
         return jsonify({
             "status": "success", 
             "message": "Đăng nhập thành công!", 
             "user_id": user.id,
-            "username": username
+            "username": username,
+            "role": session["role"]
         }), 200
     else:
         return jsonify({"status": "error", "message": "Sai mật khẩu!"}), 401
@@ -194,6 +292,7 @@ def login():
 def logout():
     session.pop("user_id", None)
     session.pop("username", None)
+    session.pop("role", None)
     return jsonify({"status": "success", "message": "Đã đăng xuất"})
 
 @app.route("/check-auth", methods=["GET"])
@@ -202,7 +301,8 @@ def check_auth():
         return jsonify({
             "status": "success",
             "user_id": session["user_id"],
-            "username": session.get("username", "")
+            "username": session.get("username", ""),
+            "role": session.get("role", "user")
         })
     return jsonify({"status": "error"}), 401
 #forgot password
@@ -246,7 +346,7 @@ def borrow_book():
     book_id = data.get("book_id")
     if book_id:
         book = db.session.get(Book, book_id)
-        if not book or not book.available:
+        if not book or (book.quantity or 1) <= 0:
             return jsonify({"status": "error", "message": "Sách không khả dụng"}), 400
     else:
         title = data.get("title")
@@ -275,7 +375,7 @@ def borrow_book():
             )
             db.session.add(book)
             db.session.commit()
-        elif not book.available:
+        elif (book.quantity or 1) <= 0:
             return jsonify({"status": "error", "message": "Sách đang được mượn"}), 400
         else:
             if description and not book.description:
@@ -283,7 +383,12 @@ def borrow_book():
             if preview_link and not book.file_path:
                 book.file_path = preview_link
 
-    existing = BorrowRecord.query.filter_by(user_id=user_id, book_id=book.id, returned=False).first()
+    existing = BorrowRecord.query.filter(
+        BorrowRecord.user_id == user_id,
+        BorrowRecord.book_id == book.id,
+        BorrowRecord.status.in_(["pending", "approved", "return_pending"]),
+        BorrowRecord.returned == False
+    ).first()
     if existing:
         return jsonify({"status": "error", "message": "Bạn đã mượn sách này rồi!"}), 400
 
@@ -291,10 +396,11 @@ def borrow_book():
     borrow = BorrowRecord(
         user_id=user_id,
         book_id=book.id,
+        request_date=now,
         borrow_date=now,
-        due_date=now + timedelta(days=borrow_days)
+        due_date=now + timedelta(days=borrow_days),
+        status="pending"
     )
-    book.available = False
     db.session.add(borrow)
     db.session.commit()
 
@@ -304,7 +410,8 @@ def borrow_book():
         "book_id": book.id,
         "borrow_id": borrow.id,
         "due_date": borrow.due_date.isoformat(),
-        "borrow_days": borrow_days
+        "borrow_days": borrow_days,
+        "borrow_status": borrow.status
     })
 
 @app.route("/return", methods=["POST"])
@@ -323,18 +430,14 @@ def return_book():
     record = BorrowRecord.query.filter_by(
         user_id=session["user_id"], 
         book_id=book_id, 
-        returned=False
+        returned=False,
+        status="approved"
     ).first()
 
     if not record:
         return jsonify({"status": "error", "message": "Không tìm thấy sách đã mượn"}), 400
 
-    record.returned = True
-    record.return_date = datetime.utcnow()
-
-    book = db.session.get(Book, book_id)
-    if book:
-        book.available = True
+    record.status = "return_pending"
 
     db.session.commit()
     return jsonify({"status": "success", "message": "Trả sách thành công!"}), 200
@@ -345,7 +448,7 @@ def get_borrowed_count():
         return jsonify({"count": 0})
     
     user_id = session["user_id"]
-    count = BorrowRecord.query.filter_by(user_id=user_id, returned=False).count()
+    count = BorrowRecord.query.filter_by(user_id=user_id, returned=False, status="approved").count()
     return jsonify({"count": count})
 
 @app.route("/api/user/borrowed-books", methods=["GET"])
@@ -357,7 +460,8 @@ def get_borrowed_books():
     
     records = BorrowRecord.query.filter_by(
         user_id=user_id, 
-        returned=False
+        returned=False,
+        status="approved"
     ).join(Book, BorrowRecord.book_id == Book.id).all()
     
     borrowed_books = []
@@ -566,6 +670,402 @@ def search_books():
         })
 
     return jsonify({"status": "success", "total": len(result), "books": result})
+
+# ===================== ADMIN API =====================
+ADMIN_ROLES = {"super_admin", "admin", "librarian"}
+
+def is_admin_user():
+    user_id = session.get("user_id")
+    if not user_id:
+        return False
+    user = db.session.get(User, user_id)
+    if not user:
+        return False
+    return (user.role in ADMIN_ROLES) or (user.username or "").lower() == "admin"
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not is_admin_user():
+            return jsonify({"status": "error", "message": "Admin permission required"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+def book_payload(book):
+    category = db.session.get(Category, book.category_id) if book.category_id else None
+    return {
+        "id": book.id,
+        "google_book_id": book.google_book_id or "",
+        "title": book.title or "",
+        "author": book.author or "",
+        "description": book.description or "",
+        "isbn": book.isbn or "",
+        "image": book.image or "",
+        "preview_link": book.file_path or "",
+        "quantity": book.quantity or 0,
+        "available": bool(book.available),
+        "shelf_location": book.shelf_location or "",
+        "category_id": book.category_id,
+        "category_name": category.name if category else "",
+    }
+
+def user_payload(user):
+    active_count = BorrowRecord.query.filter_by(
+        user_id=user.id,
+        returned=False,
+        status="approved"
+    ).count()
+    return {
+        "id": user.id,
+        "username": user.username,
+        "full_name": user.full_name or user.username,
+        "email": user.email or "",
+        "role": user.role or "user",
+        "is_locked": bool(user.is_locked),
+        "status_text": "Khóa" if user.is_locked else "Hoạt động",
+        "borrowed_count": active_count,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+    }
+
+def borrow_payload(record):
+    due_date = record.due_date
+    now = datetime.utcnow()
+    overdue_days = 0
+    if due_date and not record.returned and record.status in ("approved", "return_pending") and due_date < now:
+        overdue_days = (now.date() - due_date.date()).days
+    return {
+        "id": record.id,
+        "user_id": record.user_id,
+        "username": record.user.username if record.user else "",
+        "user_email": record.user.email if record.user else "",
+        "book_id": record.book_id,
+        "book_title": record.book.title if record.book else "",
+        "book_author": record.book.author if record.book else "",
+        "request_date": record.request_date.isoformat() if record.request_date else None,
+        "borrow_date": record.borrow_date.isoformat() if record.borrow_date else None,
+        "due_date": due_date.isoformat() if due_date else None,
+        "return_date": record.return_date.isoformat() if record.return_date else None,
+        "returned": bool(record.returned),
+        "status": record.status or "approved",
+        "reject_reason": record.reject_reason or "",
+        "fine_amount": record.fine_amount or 0,
+        "overdue_days": max(0, overdue_days),
+    }
+
+@app.route("/api/admin/dashboard", methods=["GET"])
+@admin_required
+def admin_dashboard():
+    now = datetime.utcnow()
+    month_start = datetime(now.year, now.month, 1)
+    total_users = User.query.count()
+    new_users = User.query.filter(User.created_at >= month_start).count()
+    total_books = Book.query.count()
+    total_copies = db.session.query(db.func.coalesce(db.func.sum(Book.quantity), 0)).scalar() or 0
+    active_borrows = BorrowRecord.query.filter_by(status="approved", returned=False).count()
+    returned_count = BorrowRecord.query.filter_by(returned=True).count()
+    overdue_count = BorrowRecord.query.filter(
+        BorrowRecord.status.in_(["approved", "return_pending"]),
+        BorrowRecord.returned == False,
+        BorrowRecord.due_date < now
+    ).count()
+    top_books = db.session.query(
+        Book.title,
+        db.func.count(BorrowRecord.id).label("borrow_count")
+    ).join(BorrowRecord, BorrowRecord.book_id == Book.id).group_by(Book.id, Book.title).order_by(db.func.count(BorrowRecord.id).desc()).limit(5).all()
+
+    return jsonify({
+        "status": "success",
+        "summary": {
+            "total_users": total_users,
+            "new_users_this_month": new_users,
+            "total_books": total_books,
+            "total_copies": int(total_copies),
+            "active_borrows": active_borrows,
+            "returned_count": returned_count,
+            "overdue_count": overdue_count,
+        },
+        "top_books": [{"title": row.title, "borrow_count": row.borrow_count} for row in top_books]
+    })
+
+@app.route("/api/admin/users", methods=["GET"])
+@admin_required
+def admin_users():
+    keyword = request.args.get("q", "").strip()
+    query = User.query
+    if keyword:
+        pattern = f"%{keyword}%"
+        query = query.filter(db.or_(
+            User.username.ilike(pattern),
+            User.full_name.ilike(pattern),
+            User.email.ilike(pattern)
+        ))
+    users = query.order_by(User.id.desc()).limit(200).all()
+    return jsonify({"status": "success", "users": [user_payload(user) for user in users]})
+
+@app.route("/api/admin/users/<int:user_id>", methods=["PATCH", "DELETE"])
+@admin_required
+def admin_user_detail(user_id):
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"status": "error", "message": "User not found"}), 404
+    if request.method == "DELETE":
+        db.session.delete(user)
+        db.session.commit()
+        return jsonify({"status": "success"})
+
+    data = request.get_json() or {}
+    for field in ("full_name", "email", "role"):
+        if field in data:
+            setattr(user, field, data.get(field))
+    if "is_locked" in data:
+        user.is_locked = bool(data.get("is_locked"))
+    db.session.commit()
+    return jsonify({"status": "success", "user": user_payload(user)})
+
+@app.route("/api/admin/users/<int:user_id>/history", methods=["GET"])
+@admin_required
+def admin_user_history(user_id):
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({"status": "error", "message": "User not found"}), 404
+    records = BorrowRecord.query.filter_by(user_id=user_id).order_by(BorrowRecord.id.desc()).all()
+    return jsonify({"status": "success", "user": user_payload(user), "history": [borrow_payload(r) for r in records]})
+
+@app.route("/api/admin/books", methods=["GET", "POST"])
+@admin_required
+def admin_books():
+    if request.method == "GET":
+        keyword = request.args.get("q", "").strip()
+        query = Book.query
+        if keyword:
+            pattern = f"%{keyword}%"
+            query = query.filter(db.or_(Book.title.ilike(pattern), Book.author.ilike(pattern), Book.isbn.ilike(pattern)))
+        books = query.order_by(Book.id.desc()).limit(200).all()
+        return jsonify({"status": "success", "books": [book_payload(book) for book in books]})
+
+    data = request.get_json() or {}
+    book = Book(
+        google_book_id=data.get("google_book_id"),
+        title=data.get("title"),
+        author=data.get("author"),
+        description=data.get("description"),
+        isbn=data.get("isbn"),
+        image=data.get("image"),
+        file_path=data.get("preview_link") or data.get("file_path"),
+        quantity=int(data.get("quantity") or 1),
+        shelf_location=data.get("shelf_location"),
+        category_id=data.get("category_id") or None,
+        available=True,
+    )
+    db.session.add(book)
+    db.session.commit()
+    return jsonify({"status": "success", "book": book_payload(book)}), 201
+
+@app.route("/api/admin/books/<int:book_id>", methods=["PATCH", "DELETE"])
+@admin_required
+def admin_book_detail(book_id):
+    book = db.session.get(Book, book_id)
+    if not book:
+        return jsonify({"status": "error", "message": "Book not found"}), 404
+    if request.method == "DELETE":
+        db.session.delete(book)
+        db.session.commit()
+        return jsonify({"status": "success"})
+
+    data = request.get_json() or {}
+    for field in ("google_book_id", "title", "author", "description", "isbn", "image", "shelf_location"):
+        if field in data:
+            setattr(book, field, data.get(field))
+    if "preview_link" in data or "file_path" in data:
+        book.file_path = data.get("preview_link") or data.get("file_path")
+    if "quantity" in data:
+        book.quantity = max(0, int(data.get("quantity") or 0))
+    if "category_id" in data:
+        book.category_id = data.get("category_id") or None
+    book.available = (book.quantity or 0) > 0
+    db.session.commit()
+    return jsonify({"status": "success", "book": book_payload(book)})
+
+@app.route("/api/admin/borrows", methods=["GET"])
+@admin_required
+def admin_borrows():
+    status_filter = request.args.get("status", "").strip()
+    query = BorrowRecord.query.join(User, BorrowRecord.user_id == User.id).join(Book, BorrowRecord.book_id == Book.id)
+    if status_filter == "overdue":
+        query = query.filter(
+            BorrowRecord.status.in_(["approved", "return_pending"]),
+            BorrowRecord.returned == False,
+            BorrowRecord.due_date < datetime.utcnow()
+        )
+    elif status_filter:
+        query = query.filter(BorrowRecord.status == status_filter)
+    records = query.order_by(BorrowRecord.id.desc()).limit(300).all()
+    return jsonify({"status": "success", "borrows": [borrow_payload(record) for record in records]})
+
+@app.route("/api/admin/borrows/<int:borrow_id>/<action>", methods=["POST"])
+@admin_required
+def admin_borrow_action(borrow_id, action):
+    record = db.session.get(BorrowRecord, borrow_id)
+    if not record:
+        return jsonify({"status": "error", "message": "Borrow record not found"}), 404
+    data = request.get_json() or {}
+
+    if action == "approve":
+        if (record.book.quantity or 0) <= 0:
+            return jsonify({"status": "error", "message": "Book quantity is not enough"}), 400
+        record.status = "approved"
+        record.borrow_date = datetime.utcnow()
+        record.book.quantity = max(0, (record.book.quantity or 0) - 1)
+        record.book.available = (record.book.quantity or 0) > 0
+    elif action == "reject":
+        record.status = "rejected"
+        record.reject_reason = data.get("reason") or ""
+        record.returned = True
+    elif action == "confirm-return":
+        record.status = "returned"
+        record.returned = True
+        record.return_date = datetime.utcnow()
+        record.book.quantity = (record.book.quantity or 0) + 1
+        record.book.available = True
+    elif action == "fine":
+        record.fine_amount = max(0, int(data.get("fine_amount") or 0))
+    elif action == "warn":
+        notification = Notification(
+            title="Nhac tra sach",
+            message=f"Vui long tra sach {record.book.title} dung han.",
+            notification_type="reminder"
+        )
+        db.session.add(notification)
+    else:
+        return jsonify({"status": "error", "message": "Invalid action"}), 400
+
+    db.session.commit()
+    return jsonify({"status": "success", "borrow": borrow_payload(record)})
+
+@app.route("/api/admin/categories", methods=["GET", "POST"])
+@admin_required
+def admin_categories():
+    if request.method == "GET":
+        categories = Category.query.order_by(Category.name.asc()).all()
+        return jsonify({"status": "success", "categories": [{"id": c.id, "name": c.name, "description": c.description or ""} for c in categories]})
+    data = request.get_json() or {}
+    category = Category(name=data.get("name"), description=data.get("description"))
+    db.session.add(category)
+    db.session.commit()
+    return jsonify({"status": "success", "category": {"id": category.id, "name": category.name, "description": category.description or ""}}), 201
+
+@app.route("/api/admin/categories/<int:category_id>", methods=["PATCH", "DELETE"])
+@admin_required
+def admin_category_detail(category_id):
+    category = db.session.get(Category, category_id)
+    if not category:
+        return jsonify({"status": "error", "message": "Category not found"}), 404
+    if request.method == "DELETE":
+        db.session.delete(category)
+        db.session.commit()
+        return jsonify({"status": "success"})
+    data = request.get_json() or {}
+    category.name = data.get("name", category.name)
+    category.description = data.get("description", category.description)
+    db.session.commit()
+    return jsonify({"status": "success", "category": {"id": category.id, "name": category.name, "description": category.description or ""}})
+
+@app.route("/api/admin/reviews", methods=["GET"])
+@admin_required
+def admin_reviews():
+    reviews = Review.query.order_by(Review.id.desc()).limit(200).all()
+    return jsonify({"status": "success", "reviews": [{
+        "id": r.id,
+        "username": r.user.username if r.user else "",
+        "book_title": r.book.title if r.book else "",
+        "rating": r.rating,
+        "comment": r.comment or "",
+        "hidden": bool(r.hidden),
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in reviews]})
+
+@app.route("/api/admin/reviews/<int:review_id>", methods=["PATCH", "DELETE"])
+@admin_required
+def admin_review_detail(review_id):
+    review = db.session.get(Review, review_id)
+    if not review:
+        return jsonify({"status": "error", "message": "Review not found"}), 404
+    if request.method == "DELETE":
+        db.session.delete(review)
+    else:
+        data = request.get_json() or {}
+        review.hidden = bool(data.get("hidden"))
+    db.session.commit()
+    return jsonify({"status": "success"})
+
+@app.route("/api/admin/notifications", methods=["GET", "POST"])
+@admin_required
+def admin_notifications():
+    if request.method == "GET":
+        notifications = Notification.query.order_by(Notification.id.desc()).limit(100).all()
+        return jsonify({"status": "success", "notifications": [{
+            "id": n.id,
+            "title": n.title,
+            "message": n.message,
+            "notification_type": n.notification_type,
+            "created_at": n.created_at.isoformat() if n.created_at else None,
+        } for n in notifications]})
+    data = request.get_json() or {}
+    notification = Notification(
+        title=data.get("title"),
+        message=data.get("message"),
+        notification_type=data.get("notification_type") or "general"
+    )
+    db.session.add(notification)
+    db.session.commit()
+    return jsonify({"status": "success"}), 201
+
+@app.route("/api/admin/notifications/<int:notification_id>", methods=["DELETE"])
+@admin_required
+def admin_notification_delete(notification_id):
+    notification = db.session.get(Notification, notification_id)
+    if notification:
+        db.session.delete(notification)
+        db.session.commit()
+    return jsonify({"status": "success"})
+
+@app.route("/api/admin/reports", methods=["GET", "POST"])
+@admin_required
+def admin_reports():
+    if request.method == "GET":
+        reports = ViolationReport.query.order_by(ViolationReport.id.desc()).limit(200).all()
+        return jsonify({"status": "success", "reports": [{
+            "id": r.id,
+            "username": r.user.username if r.user else "",
+            "book_title": r.book.title if r.book else "",
+            "report_type": r.report_type,
+            "message": r.message or "",
+            "status": r.status,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        } for r in reports]})
+    data = request.get_json() or {}
+    report = ViolationReport(
+        user_id=data.get("user_id"),
+        book_id=data.get("book_id"),
+        report_type=data.get("report_type") or "other",
+        message=data.get("message")
+    )
+    db.session.add(report)
+    db.session.commit()
+    return jsonify({"status": "success"}), 201
+
+@app.route("/api/admin/reports/<int:report_id>", methods=["PATCH", "DELETE"])
+@admin_required
+def admin_report_detail(report_id):
+    report = db.session.get(ViolationReport, report_id)
+    if not report:
+        return jsonify({"status": "error", "message": "Report not found"}), 404
+    if request.method == "DELETE":
+        db.session.delete(report)
+    else:
+        report.status = (request.get_json() or {}).get("status", "closed")
+    db.session.commit()
+    return jsonify({"status": "success"})
 
 # ===================== STATIC FILES =====================
 @app.route("/")
