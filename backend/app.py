@@ -1,9 +1,12 @@
 import os
 import sys
+import hashlib
+import hmac
+import uuid
 # Fix UnicodeEncodeError trên Windows terminal (CP1252 không hiểu tiếng Việt)
 sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
-from flask import Flask, jsonify, request, send_from_directory, make_response, session
+from flask import Flask, jsonify, request, send_from_directory, make_response, session, redirect
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from sqlalchemy import inspect
@@ -20,6 +23,15 @@ load_dotenv(os.path.join(current_dir, ".env"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "45"))
+
+BORROW_BASE_PRICE_30_DAYS = int(os.getenv("BORROW_BASE_PRICE_30_DAYS", "28000"))
+MOMO_ENDPOINT = os.getenv("MOMO_ENDPOINT", "https://test-payment.momo.vn/v2/gateway/api/create")
+MOMO_PARTNER_CODE = os.getenv("MOMO_PARTNER_CODE", "").strip()
+MOMO_ACCESS_KEY = os.getenv("MOMO_ACCESS_KEY", "").strip()
+MOMO_SECRET_KEY = os.getenv("MOMO_SECRET_KEY", "").strip()
+MOMO_REQUEST_TYPE = os.getenv("MOMO_REQUEST_TYPE", "captureWallet").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
+PAYMENT_TEST_MODE = os.getenv("PAYMENT_TEST_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 def ask_ollama(message):
     """Call local Ollama for natural chatbot replies."""
@@ -71,6 +83,29 @@ def ask_ollama(message):
     except ValueError as exc:
         print(f"Ollama response is not valid JSON: {exc}")
         return None
+
+def calculate_borrow_fee(borrow_days):
+    try:
+        days = int(borrow_days or 30)
+    except (TypeError, ValueError):
+        days = 30
+    days = max(1, min(days, 90))
+    return max(1000, int(round(BORROW_BASE_PRICE_30_DAYS * days / 30)))
+
+def get_public_base_url():
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL.rstrip("/")
+    return request.host_url.rstrip("/")
+
+def sign_momo(raw_signature):
+    return hmac.new(
+        MOMO_SECRET_KEY.encode("utf-8"),
+        raw_signature.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+def momo_configured():
+    return bool(MOMO_PARTNER_CODE and MOMO_ACCESS_KEY and MOMO_SECRET_KEY)
 
 # ===================== FLASK SETUP =====================
 app = Flask(__name__)
@@ -158,6 +193,12 @@ class BorrowRecord(db.Model):
     status = db.Column(db.String(30), default="pending")
     reject_reason = db.Column(db.String(255))
     fine_amount = db.Column(db.Integer, default=0)
+    payment_status = db.Column(db.String(30), default="unpaid")
+    payment_method = db.Column(db.String(30))
+    payment_amount = db.Column(db.Integer, default=0)
+    payment_order_id = db.Column(db.String(100))
+    payment_trans_id = db.Column(db.String(100))
+    payment_paid_at = db.Column(db.DateTime, nullable=True)
 
     user = db.relationship('User', backref='borrow_records')
     book = db.relationship('Book', backref='borrow_records')
@@ -227,6 +268,12 @@ with app.app_context():
     add_column_if_missing("borrow_record", borrow_columns, "status", "status VARCHAR(30) DEFAULT 'approved'")
     add_column_if_missing("borrow_record", borrow_columns, "reject_reason", "reject_reason VARCHAR(255)")
     add_column_if_missing("borrow_record", borrow_columns, "fine_amount", "fine_amount INTEGER DEFAULT 0")
+    add_column_if_missing("borrow_record", borrow_columns, "payment_status", "payment_status VARCHAR(30) DEFAULT 'unpaid'")
+    add_column_if_missing("borrow_record", borrow_columns, "payment_method", "payment_method VARCHAR(30)")
+    add_column_if_missing("borrow_record", borrow_columns, "payment_amount", "payment_amount INTEGER DEFAULT 0")
+    add_column_if_missing("borrow_record", borrow_columns, "payment_order_id", "payment_order_id VARCHAR(100)")
+    add_column_if_missing("borrow_record", borrow_columns, "payment_trans_id", "payment_trans_id VARCHAR(100)")
+    add_column_if_missing("borrow_record", borrow_columns, "payment_paid_at", "payment_paid_at DATETIME")
 
     default_categories = ["CNTT", "Kinh tế", "Marketing", "Ngoại ngữ", "Tiểu thuyết"]
     for category_name in default_categories:
@@ -393,13 +440,17 @@ def borrow_book():
         return jsonify({"status": "error", "message": "Bạn đã mượn sách này rồi!"}), 400
 
     now = datetime.utcnow()
+    payment_amount = calculate_borrow_fee(borrow_days)
     borrow = BorrowRecord(
         user_id=user_id,
         book_id=book.id,
         request_date=now,
         borrow_date=now,
         due_date=now + timedelta(days=borrow_days),
-        status="pending"
+        status="pending",
+        payment_status="unpaid",
+        payment_method="momo",
+        payment_amount=payment_amount
     )
     db.session.add(borrow)
     db.session.commit()
@@ -411,7 +462,10 @@ def borrow_book():
         "borrow_id": borrow.id,
         "due_date": borrow.due_date.isoformat(),
         "borrow_days": borrow_days,
-        "borrow_status": borrow.status
+        "borrow_status": borrow.status,
+        "payment_status": borrow.payment_status,
+        "payment_amount": borrow.payment_amount,
+        "payment_method": borrow.payment_method
     })
 
 @app.route("/return", methods=["POST"])
@@ -490,6 +544,183 @@ def get_borrowed_books():
         "status": "success",
         "books": borrowed_books
     })
+
+def payment_payload(record):
+    borrow_days = 30
+    if record.request_date and record.due_date:
+        borrow_days = max(1, (record.due_date.date() - record.request_date.date()).days)
+    amount = record.payment_amount or calculate_borrow_fee(borrow_days)
+    return {
+        "borrow_id": record.id,
+        "book_id": record.book_id,
+        "title": record.book.title if record.book else "",
+        "author": record.book.author if record.book else "",
+        "image": record.book.image if record.book else "",
+        "request_date": record.request_date.isoformat() if record.request_date else None,
+        "due_date": record.due_date.isoformat() if record.due_date else None,
+        "borrow_days": borrow_days,
+        "amount": amount,
+        "payment_status": record.payment_status or "unpaid",
+        "payment_method": record.payment_method or "momo",
+        "payment_order_id": record.payment_order_id or "",
+        "borrow_status": record.status or "pending",
+    }
+
+@app.route("/api/payments/pending", methods=["GET"])
+def user_pending_payments():
+    if "user_id" not in session:
+        return jsonify({"status": "error", "message": "Chưa đăng nhập"}), 401
+
+    records = BorrowRecord.query.filter(
+        BorrowRecord.user_id == session["user_id"],
+        BorrowRecord.status == "pending",
+        BorrowRecord.returned == False,
+        BorrowRecord.payment_status.in_(["unpaid", "processing", "failed"])
+    ).join(Book, BorrowRecord.book_id == Book.id).order_by(BorrowRecord.id.desc()).all()
+
+    total = sum((record.payment_amount or 0) for record in records)
+    return jsonify({
+        "status": "success",
+        "count": len(records),
+        "total_amount": total,
+        "items": [payment_payload(record) for record in records],
+        "base_price_30_days": BORROW_BASE_PRICE_30_DAYS
+    })
+
+def mark_momo_payment_result(payload):
+    order_id = str(payload.get("orderId") or "")
+    if not order_id:
+        return None
+    record = BorrowRecord.query.filter_by(payment_order_id=order_id).first()
+    if not record:
+        return None
+
+    result_code = str(payload.get("resultCode", ""))
+    record.payment_method = "momo"
+    record.payment_trans_id = str(payload.get("transId") or record.payment_trans_id or "")
+    if result_code == "0":
+        record.payment_status = "paid"
+        record.payment_paid_at = datetime.utcnow()
+    elif record.payment_status != "paid":
+        record.payment_status = "failed"
+    db.session.commit()
+    return record
+
+@app.route("/api/payments/momo/create", methods=["POST"])
+def create_momo_payment():
+    if "user_id" not in session:
+        return jsonify({"status": "error", "message": "Chưa đăng nhập"}), 401
+
+    data = request.get_json() or {}
+    borrow_id = data.get("borrow_id")
+    record = db.session.get(BorrowRecord, borrow_id)
+    if not record or record.user_id != session["user_id"]:
+        return jsonify({"status": "error", "message": "Không tìm thấy yêu cầu mượn"}), 404
+    if record.status != "pending":
+        return jsonify({"status": "error", "message": "Yêu cầu mượn không còn chờ thanh toán"}), 400
+    if record.payment_status == "paid":
+        return jsonify({"status": "success", "message": "Yêu cầu này đã thanh toán"}), 200
+
+    borrow_days = 30
+    if record.request_date and record.due_date:
+        borrow_days = max(1, (record.due_date.date() - record.request_date.date()).days)
+    amount = record.payment_amount or calculate_borrow_fee(borrow_days)
+
+    if PAYMENT_TEST_MODE or not momo_configured():
+        order_id = f"UNILIB-TEST-{record.id}-{uuid.uuid4().hex[:10]}"
+        record.payment_status = "paid"
+        record.payment_method = "momo_test"
+        record.payment_amount = amount
+        record.payment_order_id = order_id
+        record.payment_trans_id = f"TEST-{uuid.uuid4().hex[:12]}"
+        record.payment_paid_at = datetime.utcnow()
+        db.session.commit()
+        return jsonify({
+            "status": "success",
+            "test_mode": True,
+            "message": "Đã giả lập thanh toán thành công",
+            "order_id": order_id,
+            "amount": amount,
+            "payment_status": record.payment_status
+        })
+
+    if not momo_configured():
+        return jsonify({
+            "status": "error",
+            "message": "Chưa cấu hình MoMo. Hãy thêm MOMO_PARTNER_CODE, MOMO_ACCESS_KEY, MOMO_SECRET_KEY vào backend/.env hoặc bật PAYMENT_TEST_MODE=true để test."
+        }), 503
+
+    order_id = f"UNILIB-{record.id}-{uuid.uuid4().hex[:10]}"
+    request_id = order_id
+    order_info = f"Thanh toan muon sach UniLib #{record.id}"
+    extra_data = ""
+    base_url = get_public_base_url()
+    redirect_url = f"{base_url}/api/payments/momo/return"
+    ipn_url = f"{base_url}/api/payments/momo/ipn"
+
+    raw_signature = (
+        f"accessKey={MOMO_ACCESS_KEY}&amount={amount}&extraData={extra_data}"
+        f"&ipnUrl={ipn_url}&orderId={order_id}&orderInfo={order_info}"
+        f"&partnerCode={MOMO_PARTNER_CODE}&redirectUrl={redirect_url}"
+        f"&requestId={request_id}&requestType={MOMO_REQUEST_TYPE}"
+    )
+
+    payload = {
+        "partnerCode": MOMO_PARTNER_CODE,
+        "partnerName": "UniLib",
+        "storeId": "UniLib",
+        "requestId": request_id,
+        "amount": amount,
+        "orderId": order_id,
+        "orderInfo": order_info,
+        "redirectUrl": redirect_url,
+        "ipnUrl": ipn_url,
+        "lang": "vi",
+        "requestType": MOMO_REQUEST_TYPE,
+        "autoCapture": True,
+        "extraData": extra_data,
+        "signature": sign_momo(raw_signature),
+    }
+
+    momo_response = requests.post(MOMO_ENDPOINT, json=payload, timeout=30)
+    momo_data = momo_response.json()
+    if not momo_response.ok or not momo_data.get("payUrl"):
+        return jsonify({
+            "status": "error",
+            "message": momo_data.get("message") or "Không tạo được giao dịch MoMo",
+            "momo": momo_data
+        }), 502
+
+    record.payment_status = "processing"
+    record.payment_method = "momo"
+    record.payment_amount = amount
+    record.payment_order_id = order_id
+    db.session.commit()
+
+    return jsonify({
+        "status": "success",
+        "pay_url": momo_data.get("payUrl"),
+        "deeplink": momo_data.get("deeplink"),
+        "qr_code_url": momo_data.get("qrCodeUrl"),
+        "order_id": order_id,
+        "amount": amount,
+        "momo": momo_data
+    })
+
+@app.route("/api/payments/momo/ipn", methods=["POST"])
+def momo_ipn():
+    payload = request.get_json() or {}
+    record = mark_momo_payment_result(payload)
+    if not record:
+        return jsonify({"status": "error", "message": "Order not found"}), 404
+    return jsonify({"status": "success"})
+
+@app.route("/api/payments/momo/return", methods=["GET", "POST"])
+def momo_return():
+    payload = request.args.to_dict() if request.method == "GET" else (request.get_json() or {})
+    record = mark_momo_payment_result(payload)
+    result = "success" if record and record.payment_status == "paid" else "failed"
+    return redirect(f"/web/payment.html?payment={result}")
 #quenmk
 @app.route('/forgot-password', methods=['POST'])
 def forgot_password():
@@ -749,6 +980,12 @@ def borrow_payload(record):
         "status": record.status or "approved",
         "reject_reason": record.reject_reason or "",
         "fine_amount": record.fine_amount or 0,
+        "payment_status": record.payment_status or "unpaid",
+        "payment_method": record.payment_method or "",
+        "payment_amount": record.payment_amount or 0,
+        "payment_order_id": record.payment_order_id or "",
+        "payment_trans_id": record.payment_trans_id or "",
+        "payment_paid_at": record.payment_paid_at.isoformat() if record.payment_paid_at else None,
         "overdue_days": max(0, overdue_days),
     }
 
@@ -911,6 +1148,8 @@ def admin_borrow_action(borrow_id, action):
     data = request.get_json() or {}
 
     if action == "approve":
+        if (record.payment_status or "unpaid") != "paid":
+            return jsonify({"status": "error", "message": "Yêu cầu này chưa thanh toán"}), 400
         if (record.book.quantity or 0) <= 0:
             return jsonify({"status": "error", "message": "Book quantity is not enough"}), 400
         record.status = "approved"
